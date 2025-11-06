@@ -13,3 +13,8 @@ venv/
 desktop.ini
 thumbs.db
 temp/
+
+.specify/
+.vscode/
+.github/
+test.*
