@@ -3,7 +3,7 @@
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from wireviz.wv_colors import COLOR_CODES, Color, ColorMode, Colors, ColorScheme
 from wireviz.wv_helper import aspect_ratio, int2tuple
@@ -116,24 +116,22 @@ class Image:
 
 @dataclass
 class AdditionalComponent:
-    type: MultilineHypertext
-    subtype: Optional[MultilineHypertext] = None
-    manufacturer: Optional[MultilineHypertext] = None
-    mpn: Optional[MultilineHypertext] = None
-    supplier: Optional[MultilineHypertext] = None
-    spn: Optional[MultilineHypertext] = None
-    pn: Optional[Hypertext] = None
-    qty: float = 1
-    unit: Optional[str] = None
-    qty_multiplier: Union[ConnectorMultiplier, CableMultiplier, None] = None
-    bgcolor: Optional[Color] = None
+    type: str
+    subtype: Optional[str] = None
+    mpn: Optional[str] = None
+    qty_multiplier: Optional[str] = None
+    qty: Optional[Any] = None
 
-    @property
-    def description(self) -> str:
-        t = self.type.rstrip()
-        st = f", {self.subtype.rstrip()}" if self.subtype else ""
-        t = t + st
-        return t
+    # make description a plain field (was a read-only property causing the AttributeError)
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    bgcolor: Optional[str] = None
+
+    # allow alias from YAML (e.g. "16", "20")
+    alias: Optional[str] = None
+
+    # keep any other existing fields here
+    # ...existing code...
 
 
 @dataclass
@@ -162,7 +160,10 @@ class Connector:
     hide_disconnected_pins: bool = False
     loops: List[List[Pin]] = field(default_factory=list)
     ignore_in_bom: bool = False
-    additional_components: List[AdditionalComponent] = field(default_factory=list)
+    # allow parser to set contact_definition/additional_components and hold expanded contacts
+    contact_definition: List[str] = field(default_factory=list)
+    additional_components: List["AdditionalComponent"] = field(default_factory=list)
+    contacts: List[Any] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if isinstance(self.image, dict):

@@ -1,0 +1,34 @@
+connectors:
+  J1:
+    type: Deutsch
+    pincount: 4
+    subtype: DT04-4P
+    contact_definition: ["16","16","20","20"]
+    additional_components:
+      -
+        type: contact
+        subtype: 0462-201-16141
+        mpn: 0462-201-16141
+        alias: "16"
+      - 
+        type: contact
+        subtype: 0462-201-20141
+        mpn: 0462-201-20141
+        alias: "20"
+
+
+cables:
+  C1:
+    category: single
+    gauge: 0.5 mm2
+    length: 0.15
+    # provide two colours (one per wire) because connections reference wire 1 and wire 2
+    colors: [RD, BK]
+    # optional: explicitly state wirecount = 2
+    wirecount: 4
+
+connections:
+  -
+    - J1.J1: [1-4]
+    - C1: [1-4]
+    - J1.J2: [1-4]

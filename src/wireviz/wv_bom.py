@@ -2,7 +2,7 @@
 
 from dataclasses import asdict
 from itertools import groupby
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
 
 from wireviz.DataClasses import AdditionalComponent, Cable, Color, Connector
 from wireviz.wv_colors import translate_color
@@ -31,30 +31,65 @@ def optional_fields(part: Union[Connector, Cable, AdditionalComponent]) -> BOMEn
 def get_additional_component_table(
     harness: "Harness", component: Union[Connector, Cable]
 ) -> List[str]:
-    """Return a list of diagram node table row strings with additional components."""
+    """Return a list of diagram node table row strings with additional components.
+
+    Special handling:
+    - Parts with qty_multiplier == 'unpopulated' are included when there are cavities
+      on the connector with no wires. The quantity shown is the number of such cavities
+      the part applies to (honouring alias if present).
+    """
     rows = []
     if component.additional_components:
         rows.append(["Additional components"])
-        # Ignore components that have qty 0
-        for part in [
-            part
-            for part in component.additional_components
-            if component.get_qty_multiplier(part.qty_multiplier)
-        ]:
-            common_args = {
-                "qty": part.qty * component.get_qty_multiplier(part.qty_multiplier),
-                "unit": part.unit,
-                "bgcolor": part.bgcolor,
-            }
+        # Process each part, including 'unpopulated' parts when applicable
+        for part in component.additional_components:
+            # Determine the effective per-component count depending on qty_multiplier.
+            qm = str(part.qty_multiplier).lower() if part.qty_multiplier else ""
+            if qm == "unpopulated":
+                # compute how many cavities this applies to (requires harness/connector context)
+                count = _count_unwired_cavities(harness, component, part)
+                if count <= 0:
+                    continue
+                # treat missing qty as 1
+                try:
+                    per_item = int(part.qty) if part.qty is not None else 1
+                except Exception:
+                    try:
+                        per_item = float(part.qty)
+                    except Exception:
+                        per_item = 1
+                qty = int(per_item * count)
+                common_args = {
+                    "qty": qty,
+                    "unit": part.unit,
+                    "bgcolor": part.bgcolor,
+                }
+            else:
+                # fallback to existing behaviour for other multipliers (including 'populated')
+                multiplier = component.get_qty_multiplier(part.qty_multiplier)
+                if not multiplier:
+                    continue
+                # treat missing qty as 1 and coerce numeric values
+                try:
+                    per_item = int(part.qty) if part.qty is not None else 1
+                except Exception:
+                    try:
+                        per_item = float(part.qty)
+                    except Exception:
+                        per_item = 1
+                common_args = {
+                    "qty": per_item * multiplier,
+                    "unit": part.unit,
+                    "bgcolor": part.bgcolor,
+                }
+
             if harness.options.mini_bom_mode:
                 id = get_bom_index(
                     harness.bom(),
                     bom_entry_key({**asdict(part), "description": part.description}),
                 )
                 rows.append(
-                    component_table_entry(
-                        f"#{id} ({part.type.rstrip()})", **common_args
-                    )
+                    component_table_entry(f"#{id} ({part.type.rstrip()})", **common_args)
                 )
             else:
                 rows.append(
@@ -65,25 +100,162 @@ def get_additional_component_table(
     return rows
 
 
-def get_additional_component_bom(component: Union[Connector, Cable]) -> List[BOMEntry]:
-    """Return a list of BOM entries with additional components."""
+def get_additional_component_bom(harness: "Harness", component: Union[Connector, Cable]) -> List[BOMEntry]:
+    """Return a list of BOM entries with additional components.
+
+    Behaviour changes:
+    - For parts with qty_multiplier == 'unpopulated' we add an entry for each unwired cavity
+      (honouring alias matching if alias is present). This allows duplicates of the same alias
+      token in contact definition to be counted separately.
+    """
     bom_entries = []
-    # Ignore components that have qty 0
-    for part in [
-        part
-        for part in component.additional_components
-        if component.get_qty_multiplier(part.qty_multiplier)
-    ]:
+    for part in component.additional_components:
+        qm = str(part.qty_multiplier).lower() if part.qty_multiplier else ""
+        if qm == "unpopulated":
+            count = _count_unwired_cavities(harness, component, part)
+            if count <= 0:
+                continue
+            per_pos = 1
+            try:
+                if part.qty is not None:
+                    per_pos = int(part.qty)
+            except Exception:
+                try:
+                    per_pos = float(part.qty)
+                except Exception:
+                    per_pos = 1
+            bom_entries.append(
+                {
+                    "description": part.description,
+                    "qty": int(count * per_pos),
+                    "unit": part.unit,
+                    "designators": component.name if component.show_name else None,
+                    **optional_fields(part),
+                }
+            )
+            continue
+
+        # Ignore components that have qty 0 according to existing multiplier logic
+        multiplier = component.get_qty_multiplier(part.qty_multiplier)
+        if not multiplier:
+            continue
+
+        # safe per-item qty (default 1)
+        per_item = 1
+        try:
+            if part.qty is not None:
+                per_item = int(part.qty)
+        except Exception:
+            try:
+                per_item = float(part.qty)
+            except Exception:
+                per_item = 1
+
         bom_entries.append(
             {
                 "description": part.description,
-                "qty": part.qty * component.get_qty_multiplier(part.qty_multiplier),
+                "qty": per_item * multiplier,
                 "unit": part.unit,
                 "designators": component.name if component.show_name else None,
                 **optional_fields(part),
             }
         )
     return bom_entries
+
+
+# --- helper utilities for detecting wired/unwired cavities ---
+
+def _parse_positions(spec_list) -> Set[int]:
+    """Parse connection spec like ['1-4','6','8,10-12'] -> zero-based indices."""
+    out = set()
+    if spec_list is None:
+        return out
+    # allow int, str or list
+    if isinstance(spec_list, int):
+        out.add(spec_list - 1)
+        return out
+    if isinstance(spec_list, str):
+        items = [spec_list]
+    else:
+        items = list(spec_list)
+    for item in items:
+        if item is None:
+            continue
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    a, b = part.split("-", 1)
+                    a_i = int(a)
+                    b_i = int(b)
+                    out.update(range(a_i - 1, b_i))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    out.add(int(part) - 1)
+                except ValueError:
+                    continue
+    return out
+
+
+def _wired_positions_for_connector(harness: "Harness", connector: Connector) -> Set[int]:
+    """Return a set of zero-based contact indices that have wires connected to this connector."""
+    wired = set()
+    # Attempt to inspect harness.connections which mirrors the input connections YAML.
+    if not hasattr(harness, "connections"):
+        return wired
+    for group in getattr(harness, "connections") or []:
+        # group is likely iterable of items; each item may be dict mapping node->positions
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            for key, val in item.items():
+                # connector identifiers may be stored in connector.name or connector.id
+                if key == connector.name or key == connector.id:
+                    wired.update(_parse_positions(val))
+    return wired
+
+
+def _count_unwired_cavities(harness: "Harness", component: Union[Connector, Cable], part: AdditionalComponent) -> int:
+    """Count how many cavities this 'unpopulated' part should apply to.
+
+    Rules:
+    - If the part has an alias, match against connector contact tokens (pinlabels / contact_definition).
+      Each matching occurrence that is unwired counts separately.
+    - If the part has no alias, it applies to all unwired cavities on the connector.
+    """
+    if not isinstance(component, Connector):
+        # For cables / non-connector components, fall back to existing multiplier behaviour (none)
+        return 0
+
+    # Determine number of positions and tokens
+    tokens = []
+    # prefer explicit contact_definition if present, else pinlabels, else construct numeric tokens
+    if getattr(component, "contact_definition", None):
+        tokens = list(component.contact_definition)
+    elif getattr(component, "pinlabels", None):
+        tokens = list(component.pinlabels)
+    else:
+        # fallback to numeric positions using pincount if available
+        pincount = getattr(component, "pincount", None) or getattr(component, "wirecount", None) or 0
+        tokens = [str(i + 1) for i in range(int(pincount) if pincount else 0)]
+
+    wired = _wired_positions_for_connector(harness, component)
+    unwired_indices = [i for i in range(len(tokens)) if i not in wired]
+
+    if part.alias is not None:
+        alias_str = str(part.alias)
+        count = 0
+        for i in unwired_indices:
+            token = tokens[i] if i < len(tokens) else None
+            if token == alias_str:
+                count += 1
+        return count
+    else:
+        return len(unwired_indices)
 
 
 def bom_entry_key(entry: BOMEntry) -> BOMKey:
@@ -123,7 +295,7 @@ def generate_bom(harness: "Harness") -> List[BOMEntry]:
             )
 
         # add connectors aditional components to bom
-        bom_entries.extend(get_additional_component_bom(connector))
+        bom_entries.extend(get_additional_component_bom(harness, connector))
 
     # cables
     # TODO: If category can have other non-empty values than 'bundle', maybe it should be part of description?
@@ -183,7 +355,7 @@ def generate_bom(harness: "Harness") -> List[BOMEntry]:
                     )
 
         # add cable/bundles aditional components to bom
-        bom_entries.extend(get_additional_component_bom(cable))
+        bom_entries.extend(get_additional_component_bom(harness, cable))
 
     # add harness aditional components to bom directly, as they both are List[BOMEntry]
     bom_entries.extend(harness.additional_bom_items)
